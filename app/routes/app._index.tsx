@@ -118,6 +118,14 @@ interface TransactionFeeSettings {
   additionalGateways: Array<{ id: string; name: string; apiName: string; rate: number; fixedFee: number }>;
 }
 
+interface ShippingCostEntry {
+  orderId: string;
+  orderName: string;
+  shippingCost: number;
+  source: "csv" | "manual";
+  uploadedAt: string;
+}
+
 // Known gateways that match Shopify API gateway names
 const KNOWN_GATEWAYS = [
   { id: "amazon_payments", name: "Amazon Pay", apiName: "amazon_payments", defaultRate: 2.9, defaultFee: 0.30 },
@@ -930,6 +938,11 @@ export const action = async ({ request }: ActionFunctionArgs) => {
                   totalDiscountsSet { shopMoney { amount } }
                   subtotalPriceSet { shopMoney { amount } }
                   totalShippingPriceSet { shopMoney { amount } }
+                  paymentGatewayNames
+                  shippingLine {
+                    originalPriceSet { shopMoney { amount } }
+                    discountedPriceSet { shopMoney { amount } }
+                  }
                   lineItems(first: 100) {
                     edges { node { quantity } }
                   }
@@ -957,6 +970,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       const grossSales = subtotal + discounts;
       const netSales = grossSales - discounts;
       const netRevenue = netSales + shippingRevenue;
+      
+      // Get payment gateway (first one if multiple)
+      const paymentGateway = order.paymentGatewayNames?.[0] || "unknown";
 
       return {
         orderId: order.id,
@@ -969,6 +985,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         shippingRevenue: Math.round(shippingRevenue * 100) / 100,
         netRevenue: Math.round(netRevenue * 100) / 100,
         itemCount,
+        paymentGateway,
+        // Note: shippingLineCost (actual cost paid for Shopify labels) would require 
+        // querying fulfillments API - for now this is undefined and will fall through to CSV/fallback
+        shippingLineCost: undefined,
       };
     }).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
@@ -1508,33 +1528,216 @@ const FREQUENCY_OPTIONS = [
   { label: "Annual", value: "annual" },
 ];
 
-function ManageCostsTab({ products, selectedCostTab, setSelectedCostTab, expenses, setExpenses }: { products: Product[]; selectedCostTab: number; setSelectedCostTab: (tab: number) => void; expenses: Expense[]; setExpenses: (expenses: Expense[]) => void }) {
+function ManageCostsTab({ 
+  products, 
+  selectedCostTab, 
+  setSelectedCostTab, 
+  expenses, 
+  setExpenses,
+  shippingSettings,
+  setShippingSettings,
+  shippingCostData,
+  setShippingCostData,
+  transactionFeeSettings,
+  setTransactionFeeSettings,
+}: { 
+  products: Product[]; 
+  selectedCostTab: number; 
+  setSelectedCostTab: (tab: number) => void; 
+  expenses: Expense[]; 
+  setExpenses: (expenses: Expense[]) => void;
+  shippingSettings: ShippingSettings;
+  setShippingSettings: (settings: ShippingSettings) => void;
+  shippingCostData: ShippingCostEntry[];
+  setShippingCostData: (data: ShippingCostEntry[]) => void;
+  transactionFeeSettings: TransactionFeeSettings;
+  setTransactionFeeSettings: (settings: TransactionFeeSettings) => void;
+}) {
   const [productCosts, setProductCosts] = useState<Map<string, number>>(new Map());
   const [searchQuery, setSearchQuery] = useState("");
   const [showExpenseModal, setShowExpenseModal] = useState(false);
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
-  const [shippingSettings, setShippingSettings] = useState<ShippingSettings>({ method: "flat", flatRate: 5, perItemRate: 2 });
-  const [transactionFeeSettings, setTransactionFeeSettings] = useState<TransactionFeeSettings>({ 
-    quickSetup: "us-basic",
-    shopifyPayments: { rate: 2.9, fixedFee: 0.30 },
-    paypal: { rate: 2.99, fixedFee: 0.49, enabled: true },
-    stripe: { rate: 2.9, fixedFee: 0.30, enabled: false },
-    shopifySurcharge: 2.0,
-    usesShopifyPayments: true,
-    additionalGateways: []
-  });
   const [showAddGatewayModal, setShowAddGatewayModal] = useState(false);
   const [selectedNewGateway, setSelectedNewGateway] = useState("");
   const [expenseForm, setExpenseForm] = useState({ name: "", category: "advertising", amount: "", frequency: "monthly" as const, startDate: new Date().toISOString().split('T')[0] });
+  
+  // Shipping CSV local state (status and ref only - data is lifted)
+  const [csvUploadStatus, setCsvUploadStatus] = useState<{ type: "success" | "error" | null; message: string }>({ type: null, message: "" });
+  const shippingFileInputRef = useRef<HTMLInputElement>(null);
+  
+  // Simulated orders needing shipping costs (in production, this would come from actual order data)
+  // These represent orders that don't have Shopify shipping labels
+  const [ordersNeedingShippingCosts] = useState([
+    { orderId: "#1001", orderName: "#1001", orderDate: "2025-01-15" },
+    { orderId: "#1002", orderName: "#1002", orderDate: "2025-01-16" },
+    { orderId: "#1003", orderName: "#1003", orderDate: "2025-01-17" },
+    { orderId: "#1004", orderName: "#1004", orderDate: "2025-01-18" },
+    { orderId: "#1005", orderName: "#1005", orderDate: "2025-01-19" },
+    { orderId: "#1006", orderName: "#1006", orderDate: "2025-01-20" },
+    { orderId: "#1007", orderName: "#1007", orderDate: "2025-01-21" },
+    { orderId: "#1008", orderName: "#1008", orderDate: "2025-01-22" },
+    { orderId: "#1009", orderName: "#1009", orderDate: "2025-01-23" },
+    { orderId: "#1010", orderName: "#1010", orderDate: "2025-01-24" },
+    { orderId: "#1011", orderName: "#1011", orderDate: "2025-01-25" },
+    { orderId: "#1012", orderName: "#1012", orderDate: "2025-01-26" },
+  ]);
+  
+  // Calculate how many orders still need shipping costs (not yet uploaded via CSV)
+  const uploadedOrderIds = new Set(shippingCostData.map(e => e.orderId));
+  const ordersMissingShippingCosts = ordersNeedingShippingCosts.filter(o => !uploadedOrderIds.has(o.orderId));
+  const missingShippingCostCount = ordersMissingShippingCosts.length;
+
+  // Download template function - creates CSV with orders that need shipping costs
+  const handleDownloadShippingTemplate = () => {
+    // Use orders that still need shipping costs for the template
+    const templateData = ordersMissingShippingCosts.length > 0 
+      ? ordersMissingShippingCosts.map(o => ({
+          order_id: o.orderId,
+          order_name: o.orderName,
+          order_date: o.orderDate,
+          shipping_cost: ""
+        }))
+      : [
+          // Fallback sample data if all orders have costs
+          { order_id: "#1001", order_name: "#1001", order_date: "2025-01-15", shipping_cost: "" },
+        ];
+    
+    const headers = "order_id,order_name,order_date,shipping_cost";
+    const rows = templateData.map(row => 
+      `${row.order_id},${row.order_name},${row.order_date},${row.shipping_cost}`
+    );
+    const csv = [headers, ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'shipping_costs_template.csv';
+    link.click();
+    URL.revokeObjectURL(link.href);
+  };
+
+  // Handle CSV file upload
+  const handleShippingCsvUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target?.result as string;
+        const lines = text.split('\n').filter(line => line.trim());
+        
+        if (lines.length < 2) {
+          setCsvUploadStatus({ type: "error", message: "CSV file is empty or has no data rows" });
+          return;
+        }
+
+        // Parse header
+        const headers = lines[0].toLowerCase().split(',').map(h => h.trim().replace(/"/g, ''));
+        const orderIdIndex = headers.findIndex(h => h === 'order_id' || h === 'orderid' || h === 'order id');
+        const shippingCostIndex = headers.findIndex(h => h === 'shipping_cost' || h === 'shippingcost' || h === 'shipping cost' || h === 'cost');
+        const orderNameIndex = headers.findIndex(h => h === 'order_name' || h === 'ordername' || h === 'order name' || h === 'name');
+
+        if (orderIdIndex === -1) {
+          setCsvUploadStatus({ type: "error", message: "CSV must have an 'order_id' column" });
+          return;
+        }
+        if (shippingCostIndex === -1) {
+          setCsvUploadStatus({ type: "error", message: "CSV must have a 'shipping_cost' column" });
+          return;
+        }
+
+        // Parse data rows
+        const newEntries: ShippingCostEntry[] = [];
+        let skippedRows = 0;
+        
+        for (let i = 1; i < lines.length; i++) {
+          const values = lines[i].split(',').map(v => v.trim().replace(/"/g, ''));
+          const orderId = values[orderIdIndex];
+          const shippingCostStr = values[shippingCostIndex];
+          const orderName = orderNameIndex !== -1 ? values[orderNameIndex] : orderId;
+          
+          // Skip rows with empty shipping cost
+          if (!shippingCostStr || shippingCostStr === '') {
+            skippedRows++;
+            continue;
+          }
+
+          const shippingCost = parseFloat(shippingCostStr.replace('$', ''));
+          
+          if (isNaN(shippingCost)) {
+            skippedRows++;
+            continue;
+          }
+
+          newEntries.push({
+            orderId: orderId,
+            orderName: orderName || orderId,
+            shippingCost: shippingCost,
+            source: "csv",
+            uploadedAt: new Date().toISOString(),
+          });
+        }
+
+        if (newEntries.length === 0) {
+          setCsvUploadStatus({ type: "error", message: "No valid shipping costs found in CSV. Make sure shipping_cost column has values." });
+          return;
+        }
+
+        // Merge with existing data (update existing orders, add new ones)
+        const updatedData = [...shippingCostData];
+        let updatedCount = 0;
+        let addedCount = 0;
+
+        newEntries.forEach(entry => {
+          const existingIndex = updatedData.findIndex(e => e.orderId === entry.orderId);
+          if (existingIndex !== -1) {
+            updatedData[existingIndex] = entry;
+            updatedCount++;
+          } else {
+            updatedData.push(entry);
+            addedCount++;
+          }
+        });
+
+        setShippingCostData(updatedData);
+        
+        let message = `Successfully imported ${newEntries.length} shipping costs`;
+        if (updatedCount > 0) message += ` (${updatedCount} updated, ${addedCount} new)`;
+        if (skippedRows > 0) message += `. ${skippedRows} rows skipped (empty or invalid).`;
+        
+        setCsvUploadStatus({ type: "success", message });
+        
+        // Clear status after 5 seconds
+        setTimeout(() => setCsvUploadStatus({ type: null, message: "" }), 5000);
+        
+      } catch (err) {
+        setCsvUploadStatus({ type: "error", message: "Failed to parse CSV file. Please check the format." });
+      }
+    };
+    
+    reader.onerror = () => {
+      setCsvUploadStatus({ type: "error", message: "Failed to read file" });
+    };
+    
+    reader.readAsText(file);
+    
+    // Reset file input so same file can be uploaded again if needed
+    if (shippingFileInputRef.current) {
+      shippingFileInputRef.current.value = '';
+    }
+  };
 
   const productsWithCost = products.filter(p => productCosts.has(p.id)).length;
   const productAccuracy = products.length > 0 ? (productsWithCost / products.length) * 100 : 0;
-  const hasShipping = shippingSettings.method !== "none";
   const hasExpenses = expenses.length > 0;
+  
+  // Shipping is complete if either: all orders have CSV costs uploaded, OR fallback estimation is configured
+  const hasShippingCostsConfigured = missingShippingCostCount === 0 || shippingSettings.method !== "none";
+  const hasPartialShippingData = shippingCostData.length > 0 && missingShippingCostCount > 0;
   
   const accuracyItems = [
     { label: "Product costs", complete: productAccuracy === 100, partial: productAccuracy > 0 },
-    { label: "Shipping costs", complete: hasShipping, partial: false },
+    { label: "Shipping costs", complete: hasShippingCostsConfigured, partial: hasPartialShippingData },
     { label: "Transaction fees", complete: true, partial: false },
     { label: "Operating expenses", complete: hasExpenses, partial: false },
   ];
@@ -1675,9 +1878,15 @@ function ManageCostsTab({ products, selectedCostTab, setSelectedCostTab, expense
                 </BlockStack>
                 
                 {/* Orders needing update banner */}
-                <Banner tone="warning">
-                  <p><strong>12 orders</strong> missing shipping costs — assuming <strong>${shippingSettings.method === "flat" ? shippingSettings.flatRate.toFixed(2) : shippingSettings.method === "per-item" ? shippingSettings.perItemRate.toFixed(2) : "0.00"}</strong> per {shippingSettings.method === "per-item" ? "item" : "order"}</p>
-                </Banner>
+                {missingShippingCostCount > 0 ? (
+                  <Banner tone="warning">
+                    <p><strong>{missingShippingCostCount} order{missingShippingCostCount !== 1 ? 's' : ''}</strong> missing shipping costs — assuming <strong>${shippingSettings.method === "flat" ? shippingSettings.flatRate.toFixed(2) : shippingSettings.method === "per-item" ? shippingSettings.perItemRate.toFixed(2) : "0.00"}</strong> per {shippingSettings.method === "per-item" ? "item" : "order"}</p>
+                  </Banner>
+                ) : (
+                  <Banner tone="success">
+                    <p>All orders have shipping costs assigned! Your profit calculations are accurate.</p>
+                  </Banner>
+                )}
 
                 {/* Shopify Shipping Labels */}
                 <Card>
@@ -1717,16 +1926,96 @@ function ManageCostsTab({ products, selectedCostTab, setSelectedCostTab, expense
                           <Text as="span" variant="bodySm" tone="subdued">Upload shipping costs from ShipStation, Shippo, Pirate Ship, etc.</Text>
                         </BlockStack>
                       </InlineStack>
+                      {shippingCostData.length > 0 && (
+                        <Badge tone="success">{shippingCostData.length} orders</Badge>
+                      )}
                     </InlineStack>
                     <Box paddingBlockStart="100" paddingInlineStart="1200">
                       <BlockStack gap="300">
                         <Text as="p" variant="bodySm" tone="subdued">
                           Upload a CSV file with <code style={{ backgroundColor: '#f4f6f8', padding: '2px 6px', borderRadius: '4px', fontSize: '12px' }}>order_id</code> and <code style={{ backgroundColor: '#f4f6f8', padding: '2px 6px', borderRadius: '4px', fontSize: '12px' }}>shipping_cost</code> columns to update your orders.
                         </Text>
+                        
+                        {csvUploadStatus.type && (
+                          <Banner
+                            tone={csvUploadStatus.type === "success" ? "success" : "critical"}
+                            onDismiss={() => setCsvUploadStatus({ type: null, message: "" })}
+                          >
+                            <p>{csvUploadStatus.message}</p>
+                          </Banner>
+                        )}
+                        
                         <InlineStack gap="300">
-                          <Button>Upload CSV</Button>
-                          <Button variant="plain">Download template</Button>
+                          <input
+                            type="file"
+                            accept=".csv"
+                            ref={shippingFileInputRef}
+                            onChange={handleShippingCsvUpload}
+                            style={{ display: 'none' }}
+                          />
+                          <Button onClick={() => shippingFileInputRef.current?.click()}>Upload CSV</Button>
+                          <Button variant="plain" onClick={handleDownloadShippingTemplate}>Download template</Button>
                         </InlineStack>
+                        
+                        {shippingCostData.length > 0 && (
+                          <Box paddingBlockStart="200">
+                            <BlockStack gap="200">
+                              <InlineStack align="space-between" blockAlign="center">
+                                <Text as="span" variant="bodySm" fontWeight="semibold">Uploaded Shipping Costs</Text>
+                                <Button 
+                                  variant="plain" 
+                                  tone="critical" 
+                                  onClick={() => {
+                                    setShippingCostData([]);
+                                    setCsvUploadStatus({ type: "success", message: "All shipping costs cleared" });
+                                    setTimeout(() => setCsvUploadStatus({ type: null, message: "" }), 3000);
+                                  }}
+                                >
+                                  Clear all
+                                </Button>
+                              </InlineStack>
+                              <div style={{ maxHeight: '200px', overflow: 'auto', border: '1px solid #e1e3e5', borderRadius: '8px' }}>
+                                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                                  <thead>
+                                    <tr style={{ borderBottom: '1px solid #e1e3e5', backgroundColor: '#f6f6f7' }}>
+                                      <th style={{ padding: '8px 12px', textAlign: 'left', fontWeight: 600 }}>Order</th>
+                                      <th style={{ padding: '8px 12px', textAlign: 'right', fontWeight: 600 }}>Shipping Cost</th>
+                                      <th style={{ padding: '8px 12px', textAlign: 'center', fontWeight: 600, width: '50px' }}>Actions</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {shippingCostData.slice(0, 10).map((entry, idx) => (
+                                      <tr key={entry.orderId} style={{ borderBottom: '1px solid #e1e3e5' }}>
+                                        <td style={{ padding: '8px 12px' }}>{entry.orderName || entry.orderId}</td>
+                                        <td style={{ padding: '8px 12px', textAlign: 'right' }}>${entry.shippingCost.toFixed(2)}</td>
+                                        <td style={{ padding: '8px 12px', textAlign: 'center' }}>
+                                          <Button
+                                            variant="plain"
+                                            tone="critical"
+                                            size="slim"
+                                            onClick={() => setShippingCostData(shippingCostData.filter(e => e.orderId !== entry.orderId))}
+                                          >
+                                            <Icon source={DeleteIcon} />
+                                          </Button>
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                                {shippingCostData.length > 10 && (
+                                  <div style={{ padding: '8px 12px', textAlign: 'center', backgroundColor: '#f6f6f7', borderTop: '1px solid #e1e3e5' }}>
+                                    <Text as="span" variant="bodySm" tone="subdued">
+                                      +{shippingCostData.length - 10} more orders
+                                    </Text>
+                                  </div>
+                                )}
+                              </div>
+                              <Text as="p" variant="bodySm" tone="subdued">
+                                Total: ${shippingCostData.reduce((sum, e) => sum + e.shippingCost, 0).toFixed(2)} across {shippingCostData.length} orders
+                              </Text>
+                            </BlockStack>
+                          </Box>
+                        )}
                       </BlockStack>
                     </Box>
                   </BlockStack>
@@ -2767,16 +3056,24 @@ function ProfitByPOSReport() {
   );
 }
 
-function ProfitByOrderReport({ currency }: { currency: string }) {
+function ProfitByOrderReport({ 
+  currency,
+  shippingSettings,
+  shippingCostData,
+  transactionFeeSettings,
+}: { 
+  currency: string;
+  shippingSettings: ShippingSettings;
+  shippingCostData: ShippingCostEntry[];
+  transactionFeeSettings: TransactionFeeSettings;
+}) {
   const fetcher = useFetcher<{ type: string; orderReport: any[]; currency: string }>();
   const currentYear = new Date().getFullYear();
   const [startDate, setStartDate] = useState(`${currentYear}-01-01`);
   const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0]);
   
+  // COGS is still hardcoded for now (would come from product costs in future)
   const productCostPercent = 40;
-  const shippingCostPerOrder = 5;
-  const transactionFeePercent = 2.9;
-  const transactionFeeFlat = 0.30;
 
   const handleRunReport = () => {
     fetcher.submit({ actionType: "profitByOrder", startDate, endDate }, { method: "POST" });
@@ -2786,17 +3083,107 @@ function ProfitByOrderReport({ currency }: { currency: string }) {
   const reportCurrency = (fetcher.data?.type === "profitByOrder" ? fetcher.data?.currency : currency) || currency;
   const isLoading = fetcher.state === "submitting" || fetcher.state === "loading";
 
+  // Create multiple lookup maps for CSV shipping costs to handle format variations
+  // e.g., "#1001" vs "1001" vs "#1001"
+  const csvShippingCostMap = new Map<string, number>();
+  shippingCostData.forEach(e => {
+    // Store with original key
+    csvShippingCostMap.set(e.orderId, e.shippingCost);
+    // Also store normalized versions (with and without #)
+    const normalized = e.orderId.replace(/^#/, '').trim();
+    csvShippingCostMap.set(normalized, e.shippingCost);
+    csvShippingCostMap.set(`#${normalized}`, e.shippingCost);
+  });
+
+  // Helper function to get shipping cost with cascade logic:
+  // 1. Shopify shipping label (from API) → 2. CSV upload → 3. Fallback estimation
+  const getShippingCost = (order: any): { cost: number; source: string } => {
+    // Priority 1: Shopify shipping label cost (if available from API)
+    // The API returns shippingLineCost which is what the merchant paid for Shopify labels
+    if (order.shippingLineCost !== undefined && order.shippingLineCost !== null && order.shippingLineCost > 0) {
+      return { cost: order.shippingLineCost, source: "shopify" };
+    }
+    
+    // Priority 2: CSV uploaded cost - try multiple format variations
+    const orderName = order.orderName || order.name || "";
+    const normalizedOrderName = orderName.replace(/^#/, '').trim();
+    
+    // Try different formats to find a match
+    const csvCost = csvShippingCostMap.get(orderName) 
+      || csvShippingCostMap.get(normalizedOrderName)
+      || csvShippingCostMap.get(`#${normalizedOrderName}`);
+    
+    if (csvCost !== undefined) {
+      return { cost: csvCost, source: "csv" };
+    }
+    
+    // Priority 3: Fallback estimation based on settings
+    if (shippingSettings.method === "flat") {
+      return { cost: shippingSettings.flatRate, source: "estimate" };
+    } else if (shippingSettings.method === "per-item") {
+      const itemCount = order.itemCount || 1;
+      return { cost: shippingSettings.perItemRate * itemCount, source: "estimate" };
+    }
+    
+    // No estimation configured
+    return { cost: 0, source: "none" };
+  };
+
+  // Helper function to calculate transaction fees based on settings
+  const getTransactionFees = (netRevenue: number, gateway: string | undefined): number => {
+    // Determine which gateway was used and get its rates
+    const gatewayLower = (gateway || "").toLowerCase();
+    
+    let rate = transactionFeeSettings.shopifyPayments.rate;
+    let fixedFee = transactionFeeSettings.shopifyPayments.fixedFee;
+    let surcharge = 0;
+    
+    if (gatewayLower.includes("paypal") && transactionFeeSettings.paypal.enabled) {
+      rate = transactionFeeSettings.paypal.rate;
+      fixedFee = transactionFeeSettings.paypal.fixedFee;
+      if (!transactionFeeSettings.usesShopifyPayments) {
+        surcharge = transactionFeeSettings.shopifySurcharge;
+      }
+    } else if (gatewayLower.includes("stripe") && transactionFeeSettings.stripe.enabled) {
+      rate = transactionFeeSettings.stripe.rate;
+      fixedFee = transactionFeeSettings.stripe.fixedFee;
+      surcharge = transactionFeeSettings.shopifySurcharge;
+    } else if (gatewayLower.includes("shopify") || gatewayLower.includes("shop_pay")) {
+      // Shopify Payments - no surcharge
+      rate = transactionFeeSettings.shopifyPayments.rate;
+      fixedFee = transactionFeeSettings.shopifyPayments.fixedFee;
+    } else {
+      // Check additional gateways
+      const additionalGateway = transactionFeeSettings.additionalGateways.find(
+        g => gatewayLower.includes(g.apiName.toLowerCase())
+      );
+      if (additionalGateway) {
+        rate = additionalGateway.rate;
+        fixedFee = additionalGateway.fixedFee;
+        surcharge = transactionFeeSettings.shopifySurcharge;
+      }
+    }
+    
+    return (netRevenue * ((rate + surcharge) / 100)) + fixedFee;
+  };
+
   const enrichedData = orderData.map((o: any) => {
     const grossRevenue = o.grossSales + o.shippingRevenue;
     const netRevenue = grossRevenue - o.discounts;
     const cogs = netRevenue * (productCostPercent / 100);
     const grossProfit = netRevenue - cogs;
-    const shippingCost = shippingCostPerOrder;
-    const transactionFees = (netRevenue * (transactionFeePercent / 100)) + transactionFeeFlat;
+    
+    // Use cascading shipping cost logic
+    const { cost: shippingCost, source: shippingSource } = getShippingCost(o);
+    
+    // Use configured transaction fees
+    const transactionFees = getTransactionFees(netRevenue, o.paymentGateway);
+    
     const fulfillmentCost = shippingCost + transactionFees;
     const cm2 = grossProfit - fulfillmentCost;
     const margin = netRevenue > 0 ? (cm2 / netRevenue) * 100 : 0;
-    return { ...o, grossRevenue, netRevenue, cogs, grossProfit, fulfillmentCost, cm2, margin };
+    
+    return { ...o, grossRevenue, netRevenue, cogs, grossProfit, shippingCost, shippingSource, transactionFees, fulfillmentCost, cm2, margin };
   });
 
   const totals = enrichedData.reduce((acc: any, o: any) => ({
@@ -2816,7 +3203,13 @@ function ProfitByOrderReport({ currency }: { currency: string }) {
         <InlineStack align="space-between" blockAlign="center">
           <Text as="h2" variant="headingLg">Profit by Order</Text>
           {orderData.length > 0 && (
-            <Button size="slim" onClick={() => exportToCSV(enrichedData.map((row: any) => ({ ...row, date: new Date(row.createdAt).toLocaleDateString('en-US'), margin: row.margin.toFixed(1) })), `profit-by-order-${startDate}-${endDate}`, [
+            <Button size="slim" onClick={() => exportToCSV(enrichedData.map((row: any) => ({ 
+              ...row, 
+              date: new Date(row.createdAt).toLocaleDateString('en-US'), 
+              margin: row.margin.toFixed(1),
+              shippingCostFormatted: row.shippingCost?.toFixed(2) || '0.00',
+              transactionFeesFormatted: row.transactionFees?.toFixed(2) || '0.00',
+            })), `profit-by-order-${startDate}-${endDate}`, [
               { key: 'orderName', label: 'Order' },
               { key: 'date', label: 'Date' },
               { key: 'grossRevenue', label: 'Gross Revenue' },
@@ -2825,7 +3218,9 @@ function ProfitByOrderReport({ currency }: { currency: string }) {
               { key: 'netRevenue', label: 'Net Revenue' },
               { key: 'cogs', label: 'COGS' },
               { key: 'grossProfit', label: 'Gross Profit' },
-              { key: 'fulfillmentCost', label: 'Fulfillment' },
+              { key: 'shippingCostFormatted', label: 'Shipping' },
+              { key: 'shippingSource', label: 'Shipping Source' },
+              { key: 'transactionFeesFormatted', label: 'Tx Fees' },
               { key: 'cm2', label: 'CM2' },
               { key: 'margin', label: 'Margin %' },
             ])}>Export CSV</Button>
@@ -2843,7 +3238,7 @@ function ProfitByOrderReport({ currency }: { currency: string }) {
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
                 <thead style={{ position: 'sticky', top: 0, backgroundColor: '#fff' }}>
                   <tr style={{ borderBottom: '2px solid #e1e3e5' }}>
-                    {["Order", "Date", "Gross Rev", "Discounts", "Returns", "Net Rev", "COGS", "Gross Profit", "Fulfill.", "CM2", "Margin"].map((h, i) => (
+                    {["Order", "Date", "Gross Rev", "Discounts", "Returns", "Net Rev", "COGS", "Gross Profit", "Shipping", "Tx Fees", "CM2", "Margin"].map((h, i) => (
                       <th key={i} style={{ padding: '10px 12px', textAlign: i < 2 ? 'left' : 'right', fontWeight: 600, color: '#202223', whiteSpace: 'nowrap' }}>{h}</th>
                     ))}
                   </tr>
@@ -2859,7 +3254,12 @@ function ProfitByOrderReport({ currency }: { currency: string }) {
                       <td style={{ padding: '10px 12px', textAlign: 'right' }}>{formatPLCurrency(row.netRevenue, reportCurrency)}</td>
                       <td style={{ padding: '10px 12px', textAlign: 'right', color: '#d72c0d' }}>{formatPLCurrency(row.cogs, reportCurrency)}</td>
                       <td style={{ padding: '10px 12px', textAlign: 'right', color: row.grossProfit >= 0 ? '#008060' : '#d72c0d' }}>{formatPLCurrency(row.grossProfit, reportCurrency)}</td>
-                      <td style={{ padding: '10px 12px', textAlign: 'right', color: '#d72c0d' }}>{formatPLCurrency(row.fulfillmentCost, reportCurrency)}</td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', color: '#d72c0d' }}>
+                        {formatPLCurrency(row.shippingCost || 0, reportCurrency)}
+                        {row.shippingSource === 'csv' && <span style={{ marginLeft: '4px', fontSize: '10px', color: '#008060' }}>●</span>}
+                        {row.shippingSource === 'estimate' && <span style={{ marginLeft: '4px', fontSize: '10px', color: '#bf5000' }}>○</span>}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', color: '#d72c0d' }}>{formatPLCurrency(row.transactionFees || 0, reportCurrency)}</td>
                       <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 600, color: row.cm2 >= 0 ? '#008060' : '#d72c0d' }}>{formatPLCurrency(row.cm2, reportCurrency)}</td>
                       <td style={{ padding: '10px 12px', textAlign: 'right', color: row.margin >= 20 ? '#008060' : row.margin >= 10 ? '#202223' : '#d72c0d' }}>{row.margin.toFixed(1)}%</td>
                     </tr>
@@ -2867,6 +3267,18 @@ function ProfitByOrderReport({ currency }: { currency: string }) {
                 </tbody>
               </table>
             </div>
+            <Box paddingBlockStart="200">
+              <InlineStack gap="400">
+                <InlineStack gap="100" blockAlign="center">
+                  <span style={{ fontSize: '10px', color: '#008060' }}>●</span>
+                  <Text as="span" variant="bodySm" tone="subdued">CSV shipping cost</Text>
+                </InlineStack>
+                <InlineStack gap="100" blockAlign="center">
+                  <span style={{ fontSize: '10px', color: '#bf5000' }}>○</span>
+                  <Text as="span" variant="bodySm" tone="subdued">Estimated shipping cost</Text>
+                </InlineStack>
+              </InlineStack>
+            </Box>
           </Box>
         )}
         {fetcher.state === "idle" && !fetcher.data && <Box paddingBlockStart="200"><Text as="p" tone="subdued">Select a date range and click "Run Report" to view profit by individual order.</Text></Box>}
@@ -3505,6 +3917,21 @@ export default function Index() {
   const [acquisitionPeriod, setAcquisitionPeriod] = useState<"weekly" | "daily">("weekly");
   const [topProductsCount, setTopProductsCount] = useState<5 | 10 | 20>(5);
   const [expenses, setExpenses] = useState<Expense[]>([]);
+  
+  // Lifted state for shipping settings (shared across Manage Costs and Reports)
+  const [shippingSettings, setShippingSettings] = useState<ShippingSettings>({ method: "flat", flatRate: 5, perItemRate: 2 });
+  const [shippingCostData, setShippingCostData] = useState<ShippingCostEntry[]>([]);
+  
+  // Lifted state for transaction fee settings
+  const [transactionFeeSettings, setTransactionFeeSettings] = useState<TransactionFeeSettings>({ 
+    quickSetup: "us-basic",
+    shopifyPayments: { rate: 2.9, fixedFee: 0.30 },
+    paypal: { rate: 2.99, fixedFee: 0.49, enabled: true },
+    stripe: { rate: 2.9, fixedFee: 0.30, enabled: false },
+    shopifySurcharge: 2.0,
+    usesShopifyPayments: true,
+    additionalGateways: []
+  });
   
   // Date range with presets - default to Month to Date
   const today = new Date();
@@ -4156,7 +4583,12 @@ export default function Index() {
                 {selectedReport === "pl" && <PLReport currency={currency} />}
                 {selectedReport === "profitByChannel" && <ProfitByChannelReport currency={currency} />}
                 {selectedReport === "profitByPOS" && <ProfitByPOSReport />}
-                {selectedReport === "profitByOrder" && <ProfitByOrderReport currency={currency} />}
+                {selectedReport === "profitByOrder" && <ProfitByOrderReport 
+                  currency={currency} 
+                  shippingSettings={shippingSettings}
+                  shippingCostData={shippingCostData}
+                  transactionFeeSettings={transactionFeeSettings}
+                />}
                 {selectedReport === "profitByProduct" && <ProfitByProductReport currency={currency} productTypes={productTypes} productTags={productTags} />}
                 {selectedReport === "profitByProductType" && <ProfitByProductTypeReport currency={currency} />}
                 {selectedReport === "profitBySKU" && <ProfitBySKUReport currency={currency} />}
@@ -4168,7 +4600,19 @@ export default function Index() {
         )}
 
         {selectedTab === 2 && (
-          <ManageCostsTab products={products} selectedCostTab={selectedCostTab} setSelectedCostTab={setSelectedCostTab} expenses={expenses} setExpenses={setExpenses} />
+          <ManageCostsTab 
+            products={products} 
+            selectedCostTab={selectedCostTab} 
+            setSelectedCostTab={setSelectedCostTab} 
+            expenses={expenses} 
+            setExpenses={setExpenses}
+            shippingSettings={shippingSettings}
+            setShippingSettings={setShippingSettings}
+            shippingCostData={shippingCostData}
+            setShippingCostData={setShippingCostData}
+            transactionFeeSettings={transactionFeeSettings}
+            setTransactionFeeSettings={setTransactionFeeSettings}
+          />
         )}
 
         {selectedTab === 3 && (
